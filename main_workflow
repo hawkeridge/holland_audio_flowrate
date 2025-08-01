@@ -1,0 +1,573 @@
+import pandas as pd
+import miniaudio
+import math
+import numpy as np
+import matplotlib.pyplot as plt
+from scipy.fft import fft
+import tensorflow as tf
+import keras
+from tensorflow.keras import layers
+from sklearn.preprocessing import StandardScaler
+from sklearn.decomposition import PCA
+from sklearn.metrics import mean_absolute_error
+import statsmodels.api as sm
+import wave
+import time
+from tqdm import tqdm
+
+tf_seed = 124
+np_seed = 123
+
+def build_model(modelarch): # auto-build model from architecture description
+
+    init = keras.initializers.GlorotUniform(seed=tf_seed)
+
+    name = modelarch.split('_')
+    activation = name[1]
+    arch = name[0]
+    layer = arch.split('-')
+    model = keras.Sequential()
+    for units in layer:
+        model.add(layers.Dense(units=int(units), activation=activation, kernel_initializer=init))
+    model.add(layers.Dense(units=1, kernel_initializer=init))
+
+    for i, layer in enumerate(model.layers):
+        layer._name = 'layer_' + str(i)
+
+    return model
+
+def daf_workflow(modeltype='linearmodel', modelarch='64-64_relu', N = None, trainingset='duty-only'):
+
+    print('Model:', modeltype) # 'linearmodel' 'neuralnetwork'
+    print('Model architecture:', modelarch) # # description of model architecture and activation function, if NN used
+    print('N =', N) # number of most correlated PCs to use. N = None: no PCs (full spectrum); N = 0: all PCs; N = integer > 0: N PCs
+
+    audio_location =  'daf_twas_audio.WAV' # 'daf_long_MIC1_combined.WAV'
+    scada_location = 'SCADA.xlsx' # 'DataforJess2 - truncated and names changed.xlsx'
+    sheet_name = 'TWAS'
+    index_column = 'Time'
+    flow_data_column = 'FlowRate' # 'PRIMARY.ST018CIT.ST018.ST018DAF0420FIT0004asValue (L/s)'
+    sample_length = 2000 # in seconds
+    scada_offset = 41 # offset from start, in seconds
+    scada_sample_rate = 1 # logging rate in seconds
+    offset = 0 # audio offset from start, in seconds
+    
+    name = ''.join([modeltype,'_',modelarch,'_N',str(N)])
+    print('Name:', name)
+    subsample_length = scada_sample_rate # seconds
+
+    # Stream the audio file
+    with wave.open(audio_location, 'rb') as file:
+        print(file.getparams())
+        sample_rate = file.getframerate()
+    n_channels = 1
+    scada_total = pd.read_excel(scada_location, sheet_name=sheet_name, header=0, index_col=index_column)
+
+    first_sample = True
+
+    predictions_tosave = []
+    scada_tosave = []
+    capturedvariance_tosave = []
+    coeffs_tosave = []
+    pvalues_tosave = []
+    topPCs_tosave = []
+
+    mic = []
+    sample_generator = miniaudio.stream_file(
+        filename = audio_location,
+        sample_rate = sample_rate,
+        seek_frame = int((offset)*scada_sample_rate*sample_rate), # frame to start on (offset)
+        frames_to_read = int(sample_length*sample_rate),
+        output_format = miniaudio.SampleFormat.FLOAT32,
+        nchannels = n_channels)
+    for sample in sample_generator:
+        mic.append(np.asarray(sample))
+
+    print('Sample length (seconds):',sample_length)
+    print('SCADA:',scada_total[flow_data_column])
+    print('Total number of samples available:', len(mic))
+
+    print('Original audio, first sample:', mic[0])
+
+    match trainingset:
+        case 'duty-only':
+            trainingsamples = [0,1,2] # normally 0 1 2
+            testsamples = [3,4,15]
+        case 'standby-only':
+            trainingsamples = [6,7,8] # This will have different PCs!
+            testsamples = [0,1,2,3,4,5,9,10,11,12,13,14,15] # or if you only want to test the standby data: [12]
+        case 'cross-training':
+            trainingsamples = [0,1,6]
+            testsamples = [2,3,4,5,7,8,9,10,11,12,13,14,15]
+        case 'anomalies':
+            trainingsamples = [0,5,9]
+            testsamples = [1,2,3,4,6,7,8,10,11,12,13,14,15]
+    samples = trainingsamples + testsamples
+    print('Training samples:',trainingsamples)
+    print('Test samples:',testsamples)
+
+    if modeltype == 'neuralnetwork':
+        for samplenumber in samples:
+            sample = mic[samplenumber]
+            print('Sample ' + str(samplenumber))
+            first_subsample = True
+            plt.clf()
+            # Take corresponding sample from SCADA
+            scada_sample_length = int(sample_length/scada_sample_rate)
+            scada_flow_sample = scada_total[flow_data_column][samplenumber*scada_sample_length + scada_offset:(samplenumber+1)*scada_sample_length + scada_offset] # I think overflow is handled implicitly because I loop through the sample length and take SCADA subsamples as required, so any extra is just not used
+            L = subsample_length*sample_rate
+            num_subsamples = math.floor(len(sample)/(subsample_length*sample_rate)) # this would be simpler to calculate if the scada (as given to me) always had a fixed timestep, but sometimes it doesn't % i think this is also the reason for the slight discrepancy between the scada_sample_length and num_subsamples
+            subsample_flow = np.zeros((num_subsamples))
+
+            for i in range(num_subsamples):
+                subsample = sample[int(i*L) : int((i+1)*L)]
+                scada_flow_subsample = scada_flow_sample[i:i+1] # scada values for this subsample # currently matching the SCADA sample rate with the subsample length which means that I use one line of SCADA per subsample and hence no averaging is required either
+                
+                subsample_fft = fft(subsample) # calculate fft of each subsample
+                subsample_fft_1d_mic1 = np.reshape(subsample_fft, (1, len(subsample_fft)))
+                # compute the two-sided spectrum
+                subsample_P2 = np.abs(subsample_fft_1d_mic1/L)
+                subsample_P1 = subsample_P2[0][0:int(L/2+1)]
+                subsample_P1[1:-1] = 2*subsample_P1[1:-1]
+                subsample_P1 = np.atleast_2d(subsample_P1)
+
+                if first_subsample:
+                    subsample_ffts = subsample_P1
+                    subsample_flow[i] = scada_flow_subsample
+                    first_subsample = False
+                else:
+                    subsample_ffts = np.append(subsample_ffts, subsample_P1, axis=0)
+                    subsample_flow[i] = scada_flow_subsample
+                    
+            ffts = pd.DataFrame(subsample_ffts)
+            ffts.columns = ffts.columns.astype(str)
+            scada = pd.DataFrame({'Flow':subsample_flow}, index=np.arange(len(subsample_flow)))
+
+            plt.clf()
+            plt.plot(np.linspace(0,len(scada['Flow']),len(scada['Flow'])),scada['Flow'])
+            plt.ylabel('Flow Rate (L/s)')
+            plt.xlabel('Time (s)')
+            plt.title('SCADA for sample '+str(samplenumber))
+            plt.show()
+            plt.savefig('scada_'+name+'_sample'+str(samplenumber)+'.png')
+
+            print('Audio after FFT:')
+            print(ffts)
+
+            ### Running PCA if needed ###
+            if N != None: # i.e. don't run PCA if not required
+                print("Running PCA...")
+                if first_sample:
+
+                    # Create an instance of a PCA model
+                    pca = PCA(0.95) # 0.95 => number of components is chosen such that 95% of the variance is retained
+                    pca.fit(ffts)
+                    print('# of PCs at 95% variance:',pca.n_components_) # shows how many components this turns out to be
+
+                    # Apply the mapping to the training and test sets
+                    ffts_afterPCA = pd.DataFrame(pca.transform(ffts))
+                    print('Audio after PCA:')
+                    print(ffts_afterPCA)
+                        
+                else:
+                    # Apply the original mapping to subsequent samples
+                    ffts_afterPCA = pd.DataFrame(pca.transform(ffts))
+                    print('Audio after PCA:')
+                    print(ffts_afterPCA)
+
+                ffts = ffts_afterPCA # keeping the variable name as FFT for consistency with the spectrum case
+
+            else:
+                print('Skipping PCA...')
+
+            scada_tosave = np.append(scada_tosave, np.array(scada['Flow']))
+            
+            # Initialise a Scaler object and fit on the training set only # should this be limited to the first sample?
+            audioscaler = StandardScaler()
+            audioscaler.fit(ffts)
+            # Apply transform to the training set
+            ffts = audioscaler.transform(ffts)
+            print('Audio after scaling:')
+            print(ffts)
+            scadascaler = StandardScaler()
+            scadascaler.fit(pd.DataFrame(scada['Flow']))
+            scada['Flow'] = scadascaler.transform(pd.DataFrame(scada['Flow']))
+            
+            if first_sample and (N != None): # i.e. if using PCA
+
+                # Correlate each PC over time with the SCADA over time:
+                corr_coeffs = np.zeros((pca.n_components_,1))
+                for j in np.arange(pca.n_components_):
+                    corr_coeffs[j,0] = np.corrcoef(ffts[:, j], scada['Flow'])[0,1]
+                # select the top N most correlated PCs (based only on the first sample - our training set)
+                top_pcs = np.argpartition(np.abs(corr_coeffs[:,0]), -N)[-N:] # indices (==PCs) of maximum N absolute coefficients
+                top_corrs = corr_coeffs[top_pcs,0] # actual maximum N absolute coefficients
+                top_pcs_corrs = pd.DataFrame({'Top PCs':top_pcs, 'Top Coefficients (Absolute)':np.abs(top_corrs), 'Top Coefficients (Sign)':np.divide(top_corrs,np.abs(top_corrs))})
+                top_pcs_corrs.sort_values(by=['Top Coefficients (Absolute)'], ascending=False, axis = 0, inplace=True)
+                print('Top PCs by SCADA correlation:')
+                print(top_pcs_corrs)
+            
+            if (N != None) and (N > 0):
+                ffts = ffts[:,top_pcs_corrs['Top PCs']]
+                print('Audio reduced to N PCs:')
+                print(ffts)
+
+            ### Building and running the ML model ###
+            print("Running model...")
+            if samplenumber in trainingsamples:
+                print('Sample',samplenumber,'(training)')
+                        
+                if first_sample:
+                    earlystopping = tf.keras.callbacks.EarlyStopping(monitor='val_loss', restore_best_weights=True, start_from_epoch=60, patience=10)
+
+                    # Build the keras sequential model:
+                    model = build_model(modelarch)
+                    model.compile(optimizer=tf.keras.optimizers.Adam(learning_rate=0.0001), loss='mean_absolute_error')
+
+                history = model.fit(
+                    tf.convert_to_tensor(ffts, dtype = tf.float32), 
+                    scada['Flow'],
+                    epochs=150,
+                    validation_split=0.2,
+                    callbacks=[earlystopping])
+            
+                # Visualize the model's training progress using the stats stored in the history object:
+                hist = pd.DataFrame(history.history)
+                hist['epoch'] = history.epoch
+                hist.tail()
+
+                plt.clf()
+                plt.semilogy(history.history['loss'], label='Training')
+                plt.semilogy(history.history['val_loss'], label='Validation')
+                plt.xlabel('Epoch')
+                plt.ylabel('Error (Flow rate)')
+                plt.legend()
+                plt.grid(True)
+                plt.title('Training history for sample '+str(samplenumber))
+                plt.savefig('history.png')
+                plt.clf()
+                plt.close()
+
+                predictions = np.atleast_2d([x[0] for x in model.predict(ffts)])[0]
+                
+                predictions = pd.DataFrame(predictions.flatten().transpose())
+                predictions = scadascaler.inverse_transform(predictions).flatten()
+                scada['Flow'] = scadascaler.inverse_transform(pd.DataFrame(scada['Flow']))
+
+                # Adding a moving average:
+                windowsize = 10
+                predictions_ma = np.zeros((len(predictions)))
+                scada_ma = np.zeros((len(scada['Flow'])))
+                for ma_padding in range(0,int((windowsize+1)/2)):
+                    predictions_ma[ma_padding] = np.mean(predictions[0:int((windowsize+1)/2)]) # padding the start of the ma array
+                    scada_ma[ma_padding] = np.mean(scada['Flow'].iloc[0:int((windowsize+1)/2)])
+                
+                for ma in range(int((windowsize+1)/2), len(predictions) - windowsize + int((windowsize+1)/2) + 1):
+                    window_pred = predictions[ma - int((windowsize+1)/2) : ma + int((windowsize+1)/2)]
+                    window_average_pred = np.mean(window_pred)
+                    predictions_ma[ma] = window_average_pred
+
+                    window_scada = scada['Flow'].iloc[ma - int((windowsize+1)/2) : ma + int((windowsize+1)/2)]
+                    window_average_scada = np.mean(window_scada)
+                    scada_ma[ma] = window_average_scada
+                
+                for ma_padding in range(len(predictions) - windowsize + int((windowsize+1)/2) + 1, len(predictions)):
+                    predictions_ma[ma_padding] = window_average_pred # padding the end of the ma array
+                    scada_ma[ma_padding] = window_average_scada
+
+                # plot the predicted flow rate against actual flow rate
+                plt.clf()
+                plt.plot(np.linspace(0, sample_length, num_subsamples), predictions.reshape(num_subsamples,), color='b', label='Predicted Flow')
+                plt.plot(np.linspace(0, sample_length, num_subsamples), np.interp(np.linspace(0, len(predictions_ma), num_subsamples), np.linspace(0, len(predictions_ma), len(predictions_ma)), predictions_ma), color='r', label='Predicted Flow (10-sample MovAvg)')
+                plt.plot(np.linspace(0, sample_length, num_subsamples), scada['Flow'], color='k', label='True Flow')
+                plt.legend()
+                plt.xlabel('Time (s)')
+                plt.ylabel('Flow Rate (L/s)')
+                plt.title('Model Predictions (sample: ' + str(samplenumber) + ', architecture: ' + modelarch + ')')
+                plt.show()
+                plt.savefig('predictions_training.png')
+                plt.close()
+
+                print('Predictions (training):')
+                print(predictions)
+
+                predictions_tosave = np.append(predictions_tosave, predictions, axis=0)
+                if first_sample:
+                    if N != None:
+                        capturedvariance_tosave = np.append(capturedvariance_tosave, np.atleast_1d(pca.explained_variance_ratio_[top_pcs_corrs['Top PCs']]), axis=0)
+                        if N != 0:
+                            topPCs_tosave = np.append(topPCs_tosave, np.atleast_1d(top_pcs_corrs['Top PCs']), axis=0)
+                        else:
+                            topPCs_tosave = np.zeros((500))
+                    else:
+                        capturedvariance_tosave = np.zeros((500))
+            
+            else:
+                print('Sample',samplenumber,'(test)')
+                print(model.summary())
+                        
+                # plot the predicted flow rate against actual flow rate
+                plt.clf()
+                predictions = np.atleast_2d([x[0] for x in model.predict(ffts)])[0]
+                
+                predictions = pd.DataFrame(predictions.flatten().transpose())
+                predictions = scadascaler.inverse_transform(predictions).flatten()
+                scada['Flow'] = scadascaler.inverse_transform(pd.DataFrame(scada['Flow']))
+                    
+                # Adding a moving average:
+                windowsize = 10
+                predictions_ma = np.zeros((len(predictions)))
+                scada_ma = np.zeros((len(scada['Flow'])))
+                for ma_padding in range(0,int((windowsize+1)/2)):
+                    predictions_ma[ma_padding] = np.mean(predictions[0:int((windowsize+1)/2)]) # padding the start of the ma array
+                    scada_ma[ma_padding] = np.mean(scada['Flow'].iloc[0:int((windowsize+1)/2)])
+                
+                for ma in range(int((windowsize+1)/2), len(predictions) - windowsize + int((windowsize+1)/2) + 1):
+                    window_pred = predictions[ma - int((windowsize+1)/2) : ma + int((windowsize+1)/2)]
+                    window_average_pred = np.mean(window_pred)
+                    predictions_ma[ma] = window_average_pred
+
+                    window_scada = scada['Flow'].iloc[ma - int((windowsize+1)/2) : ma + int((windowsize+1)/2)]
+                    window_average_scada = np.mean(window_scada)
+                    scada_ma[ma] = window_average_scada
+                
+                for ma_padding in range(len(predictions) - windowsize + int((windowsize+1)/2) + 1, len(predictions)):
+                    predictions_ma[ma_padding] = window_average_pred # padding the end of the ma array
+                    scada_ma[ma_padding] = window_average_scada
+
+                plt.plot(np.linspace(0, sample_length, num_subsamples), predictions.reshape(num_subsamples,), color='b', label='Predicted Flow')
+                plt.plot(np.linspace(0, sample_length, num_subsamples), np.interp(np.linspace(0, len(predictions_ma), num_subsamples), np.linspace(0, len(predictions_ma), len(predictions_ma)), predictions_ma), color='r', label='Predicted Flow (10-sample MovAvg)')
+                plt.plot(np.linspace(0, sample_length, num_subsamples), scada['Flow'], color='k', label='True Flow')
+                
+                plt.legend()
+                plt.xlabel('Time (s)')
+                plt.ylabel('Flow Rate (L/s)')
+                plt.title('Model Predictions (sample: ' + str(samplenumber) + ', architecture: ' + modelarch + ')')
+                plt.show()
+                plt.savefig('predictions_test.png')
+                plt.close()
+
+                predictions_tosave = np.append(predictions_tosave, predictions, axis=0) # saving predictions for the second sample and onwards
+
+            first_sample = False
+
+
+    elif modeltype == 'linearmodel':
+        
+        # train/test split - this works differently to the NN sample loop since retraining a linear model overwrites it
+        original_audio_train = []
+        scada_sample_length = int(sample_length/scada_sample_rate)
+        first = True
+        for samplenumber in trainingsamples: # Check this and set it for the dataset/pumps you want
+            original_audio_train = np.append(original_audio_train, mic[samplenumber])
+            if first:
+                scada_train = pd.DataFrame(scada_total[flow_data_column][samplenumber*scada_sample_length + scada_offset:(samplenumber+1)*scada_sample_length + scada_offset])
+                first = False
+            else:
+                scada_train = pd.concat([scada_train, pd.DataFrame(scada_total[flow_data_column][samplenumber*scada_sample_length + scada_offset:(samplenumber+1)*scada_sample_length + scada_offset])])
+
+        L = subsample_length*sample_rate
+        num_subsamples_train = math.floor(len(original_audio_train)/(subsample_length*sample_rate))
+
+        # FFT
+        audio_train = np.zeros((num_subsamples_train,22051))
+        for i in tqdm(range(num_subsamples_train)):
+            audio_sample_train = fft(original_audio_train[i*L:(i+1)*L])
+            P2 = np.abs(audio_sample_train/L)
+            P1 = P2[0:int(L/2+1)]
+            P1[1:-1] = 2*P1[1:-1]
+            audio_sample_train = np.atleast_2d(P1)
+            audio_train[i,:] = audio_sample_train
+
+        audio_train = pd.DataFrame(audio_train)
+
+        print('Audio after FFT:')
+        print(audio_train)
+
+        print('SCADA (training):')
+        print(scada_train)
+
+        # PCA
+        if N != None:
+
+            # Using only one sample for the PC generation, as in the NN case:
+            first_sample = mic[trainingsamples[0]]
+            for i in range(math.floor(len(first_sample)/(subsample_length*sample_rate))):
+                audio_sample_pca = fft(first_sample[i*L:(i+1)*L])
+                P2 = np.abs(audio_sample_pca/L)
+                P1 = P2[0:int(L/2+1)]
+                P1[1:-1] = 2*P1[1:-1]
+                audio_sample_pca = np.atleast_2d(P1)
+                if i == 0:
+                    audio_pca = audio_sample_pca
+                else:
+                    audio_pca = np.append(audio_pca, audio_sample_pca, axis=0)
+            audio_pca = pd.DataFrame(audio_pca)
+
+            pca = PCA(0.95)
+            pca.fit(audio_pca)
+            audio_train = pd.DataFrame(pca.transform(audio_train))
+
+            print('Audio after PCA')
+            print(audio_train)
+
+            # Correlating the PCs over time with the SCADA over time:
+            corr_coeffs = np.zeros((pca.n_components_))
+            for j in np.arange(pca.n_components_):
+                corr_coeffs[j] = np.corrcoef(audio_train.iloc[:, j], scada_train.T)[0,1]
+            top_pcs = np.argpartition(np.abs(corr_coeffs[:]), -N)[-N:] # indices (==PCs) of maximum N absolute coefficients
+            top_corrs = corr_coeffs[top_pcs] # actual maximum N absolute coefficients
+            top_pcs_corrs = pd.DataFrame({'Top PCs':top_pcs, 'Top Coefficients (Absolute)':np.abs(top_corrs), 'Top Coefficients (Sign)':np.divide(top_corrs,np.abs(top_corrs))})
+            top_pcs_corrs.sort_values(by=['Top Coefficients (Absolute)'], ascending=False, axis = 0, inplace=True)
+            print('Top PCs by SCADA correlation:')
+            print(top_pcs_corrs)
+            
+        # Scaling
+        audio_scaler = StandardScaler()
+        audio_train = pd.DataFrame(audio_scaler.fit_transform(audio_train))
+
+        scada_scaler = StandardScaler()
+        scada_train = pd.DataFrame(scada_scaler.fit_transform(scada_train))
+
+        print('Audio after scaling:')
+        print(audio_train)
+
+        if (N != None) and (N > 0):
+            audio_train = audio_train.iloc[:,top_pcs_corrs['Top PCs']]
+            print('Audio after reduction to N PCs:')
+            print(audio_train)
+
+        # Model training
+        x_train = sm.add_constant(audio_train)
+        model = sm.OLS(scada_train, x_train)
+        results = model.fit()
+
+        prediction_results = model.predict(results.params, x_train)
+        prediction_train = scada_scaler.inverse_transform(np.atleast_2d(prediction_results))[0]
+        scada_train = scada_scaler.inverse_transform(scada_train)
+
+        print('Params')
+        print(results.params)
+        print('P-values')
+        print(results.pvalues)
+
+        print('Predictions (training)')
+        print(prediction_train)
+
+        plt.clf()
+        plt.plot(np.linspace(0,num_subsamples_train,num_subsamples_train), prediction_train, color='b', label='Predicted Flow')
+        plt.plot(np.linspace(0,num_subsamples_train,num_subsamples_train), scada_train, color='k', label='Measured Flow')
+        plt.ylabel('Flow Rate (L/s)')
+        plt.xlabel('Time (s)')
+        plt.title('Predictions (training set, linear model)')
+        plt.legend()
+        plt.show()
+        plt.savefig('predictions_training.png')
+        plt.close()
+
+        print('Test set')
+        original_audio_test = []
+        first = True
+        for samplenumber in testsamples:
+            original_audio_test = np.append(original_audio_test, mic[samplenumber])
+            if first: # would need to update for the full dataset
+                scada_test = pd.DataFrame(scada_total[flow_data_column][samplenumber*scada_sample_length + scada_offset:(samplenumber+1)*scada_sample_length + scada_offset])
+                first = False
+            else:
+                scada_test = pd.concat([scada_test, pd.DataFrame(scada_total[flow_data_column][samplenumber*scada_sample_length + scada_offset:(samplenumber+1)*scada_sample_length + scada_offset])])
+
+        # Testing
+        num_subsamples_test = math.floor(len(original_audio_test)/(subsample_length*sample_rate))
+
+        # FFT
+        audio_test = np.zeros((num_subsamples_test,22051))
+        for i in range(num_subsamples_test):
+            audio_sample_test = fft(original_audio_test[i*L:(i+1)*L])
+            P2 = np.abs(audio_sample_test/L)
+            P1 = P2[0:int(L/2+1)]
+            P1[1:-1] = 2*P1[1:-1]
+            audio_sample_test = np.atleast_2d(P1)
+            audio_test[i,:] = audio_sample_test
+        
+        audio_test = pd.DataFrame(audio_test)
+
+        print('Audio after FFT:')
+        print(audio_test)
+
+        # PCA
+        if N != None:
+            audio_test = pd.DataFrame(pca.transform(audio_test))
+            print('PCAd audio')
+            print(audio_test)
+
+        # Scaling
+        audio_test = pd.DataFrame(audio_scaler.transform(audio_test))
+        scada_test = pd.DataFrame(scada_scaler.transform(scada_test))
+
+        print('Scaled test')
+        print(audio_test)
+
+        if (N != None) and (N > 0):
+            audio_test = audio_test.iloc[:,top_pcs_corrs['Top PCs']]
+            print('Audio reduced to N PCs:')
+            print(audio_test)
+
+        # Model predicting
+        x_test = sm.add_constant(audio_test)
+        prediction_test = scada_scaler.inverse_transform(np.atleast_2d(model.predict(results.params, x_test)))[0]
+        scada_test = scada_scaler.inverse_transform(scada_test)
+
+        print('Predictions (test)')
+        print(prediction_test)
+
+        plt.clf()
+        plt.plot(np.linspace(0,num_subsamples_test,num_subsamples_test), prediction_test, color='b', label='Predicted Flow')
+        plt.plot(np.linspace(0,num_subsamples_test,num_subsamples_test), scada_test, color='k', label='Measured Flow')
+        plt.ylabel('Flow Rate (L/s)')
+        plt.xlabel('Time (s)')
+        plt.title('Predictions (test set, linear model)')
+        plt.legend()
+        plt.show()
+        plt.savefig('predictions_test.png')
+        plt.close()
+
+        predictions_tosave = np.concatenate((prediction_train, prediction_test)).T
+        scada_tosave = np.concatenate((scada_train, scada_test))
+        pvalues_tosave = results.pvalues
+        print('P-values:')
+        print(pvalues_tosave)
+
+        if N != None:
+            capturedvariance_tosave = np.append(capturedvariance_tosave, np.atleast_1d(pca.explained_variance_ratio_[top_pcs_corrs['Top PCs']]), axis=0)
+            if N != 0:
+                topPCs_tosave = np.append(topPCs_tosave, np.atleast_1d(top_pcs_corrs['Top PCs']), axis=0)
+            else:
+                topPCs_tosave = np.zeros((500))
+        else:
+            capturedvariance_tosave = np.zeros((500))
+            
+    if modeltype == 'linearmodel':
+        coeffs_tosave = results.params
+    else:
+        coeffs_tosave = np.zeros((22051))
+
+    return predictions_tosave, scada_tosave, capturedvariance_tosave, coeffs_tosave, pvalues_tosave, topPCs_tosave
+
+
+if __name__ == '__main__':
+    predictions_tosave, scada_tosave, capturedvariance_tosave, coeffs_tosave, pvalues_tosave, topPCs_tosave = daf_workflow()
+    print(predictions_tosave)
+    with pd.ExcelWriter('daf_outputs.xlsx') as writer:
+        predictions = pd.DataFrame(predictions_tosave)
+        scada = pd.DataFrame(scada_tosave)
+        capturedvariance = pd.DataFrame(capturedvariance_tosave,index=topPCs_tosave)
+        coeffs = pd.DataFrame(coeffs_tosave)
+        pvalues = pd.DataFrame(pvalues_tosave)
+        topPCs = pd.DataFrame(topPCs_tosave)
+
+        predictions.to_excel(writer, sheet_name = 'Predictions',header=['Predicted flow (1s interval)'])
+        scada.to_excel(writer, sheet_name = 'SCADA',header=['SCADA output for the samples used (1s interval)'])
+        capturedvariance.to_excel(writer, sheet_name = 'CapturedVariance',header=['Variance captured by each PC (if used)'])
+        coeffs.to_excel(writer, sheet_name = 'OLSCoefficients',header=['Weights for each regressor (OLS only)'])
+        pvalues.to_excel(writer, sheet_name = 'Pvalues',header=['Pvalues for each regressor (OLS only)'])
+        topPCs.to_excel(writer, sheet_name = 'TopPCs',header=['Top N PCs by SCADA correlation'])
