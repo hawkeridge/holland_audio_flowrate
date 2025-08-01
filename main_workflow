@@ -42,11 +42,11 @@ def daf_or_centrifuge_streaming(modeltype='linearmodel', modelarch='64-64_relu',
     print('Model architecture:', modelarch) # # description of model architecture and activation function, if NN used
     print('N =', N) # number of most correlated PCs to use. N = None: no PCs (full spectrum); N = 0: all PCs; N = integer > 0: N PCs
 
-    audio_location =  'daf_long_MIC1_combined.WAV' #'daf_twas_audio.WAV'
-    scada_location = 'DataforJess2 - truncated and names changed.xlsx' # 'SCADA.xlsx'
+    audio_location =  'daf_twas_audio.WAV'
+    scada_location = 'SCADA.xlsx'
     sheet_name = 'TWAS'
     index_column = 'Time'
-    flow_data_column = 'PRIMARY.ST018CIT.ST018.ST018DAF0420FIT0004asValue (L/s)' # 'FlowRate'
+    flow_data_column = 'FlowRate'
     sample_length = 2000 # in seconds
     scada_offset = 41 # offset from start, in seconds
     scada_sample_rate = 1 # logging rate in seconds
