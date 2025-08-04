@@ -42,7 +42,7 @@ def daf_or_centrifuge_streaming(modeltype='linearmodel', modelarch='64-64_relu',
     print('Model architecture:', modelarch) # # description of model architecture and activation function, if NN used
     print('N =', N) # number of most correlated PCs to use. N = None: no PCs (full spectrum); N = 0: all PCs; N = integer > 0: N PCs
 
-    audio_location =  'daf_twas_audio.WAV'
+    audio_location =  'daf_audio.wav'
     scada_location = 'SCADA.xlsx'
     sheet_name = 'TWAS'
     index_column = 'Time'
@@ -180,16 +180,18 @@ def daf_or_centrifuge_streaming(modeltype='linearmodel', modelarch='64-64_relu',
                 print('Skipping PCA...')
 
             scada_tosave = np.append(scada_tosave, np.array(scada['Flow']))
-            
-            # Initialise a Scaler object and fit on the training set only # should this be limited to the first sample?
-            audioscaler = StandardScaler()
-            audioscaler.fit(ffts)
-            # Apply transform to the training set
+
+            if first_sample:
+                # Initialise a Scaler object and fit on the training set only
+                audioscaler = StandardScaler()
+                audioscaler.fit(ffts)
+                scadascaler = StandardScaler()
+                scadascaler.fit(pd.DataFrame(scada['Flow']))
+            # Apply transforms to the training set
             ffts = audioscaler.transform(ffts)
             print('Audio after scaling:')
             print(ffts)
-            scadascaler = StandardScaler()
-            scadascaler.fit(pd.DataFrame(scada['Flow']))
+            
             scada['Flow'] = scadascaler.transform(pd.DataFrame(scada['Flow']))
             
             if first_sample and (N != None): # i.e. if using PCA
